@@ -9,24 +9,50 @@ on:
 jobs:
   build:
     # 22.04 on purpose, not ubuntu-latest: m3-toolchain is a prebuilt crosstool-NG
-    # compiler and older prebuilt toolchains sometimes miss libraries that 24.04
-    # dropped. If this ever stops being offered, try ubuntu-latest.
+    # compiler from the Ubuntu 14.10 era and the newer runner images keep dropping
+    # the old runtime libraries it expects.
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout (with the m3-toolchain submodule)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Make the cross-compiler executable
-        # Defensive: git normally preserves the exec bit, but a toolchain that
-        # arrives without it fails with a confusing "Permission denied".
-        run: chmod -R +x mazda/m3-toolchain/bin mazda/m3-toolchain/libexec || true
+      - name: Fetch the ARM cross-compiler
+        # Cloned explicitly instead of as a git submodule. The first attempt used
+        # actions/checkout's submodules:recursive and the job died in 5s with exit
+        # 127 - too fast to have cloned a few hundred MB of compiler, and the
+        # submodule's own failure never surfaced. A separate step fails loudly.
+        # --depth 1: the repo is prebuilt binaries, its history is dead weight.
+        run: |
+          rm -rf mazda/m3-toolchain
+          git clone --depth 1 https://github.com/lmagder/m3-toolchain mazda/m3-toolchain
+          chmod -R +x mazda/m3-toolchain/bin mazda/m3-toolchain/libexec || true
 
-      - name: Show the compiler version
-        # Fails loudly and early if the submodule did not come down, instead of
-        # letting make die on a missing binary 200 lines later.
+      - name: Inspect the toolchain
+        # Exit 127 means "not found", which covers BOTH a missing file and a binary
+        # whose ELF interpreter is missing - e.g. a 32-bit x86 compiler on a 64-bit
+        # runner. Print enough to tell those apart without another blind re-run.
+        run: |
+          echo "runner arch: $(uname -m)"
+          ls -l mazda/m3-toolchain/ || true
+          ls -l mazda/m3-toolchain/bin/ | head -n 15 || true
+          file mazda/m3-toolchain/bin/arm-cortexa9_neon-linux-gnueabi-g++ || true
+          file mazda/m3-toolchain/libexec/gcc/arm-cortexa9_neon-linux-gnueabi/*/cc1plus || true
+
+      - name: Install 32-bit runtime if the toolchain is i386
+        run: |
+          if file mazda/m3-toolchain/bin/arm-cortexa9_neon-linux-gnueabi-g++ | grep -q 'ELF 32-bit'; then
+            echo "32-bit toolchain detected - adding the i386 runtime"
+            sudo dpkg --add-architecture i386
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libc6:i386 libstdc++6:i386 zlib1g:i386
+          else
+            echo "64-bit toolchain - nothing to install"
+          fi
+
+      - name: Compiler version
+        # Fails loudly and early if the compiler still will not execute, instead
+        # of letting make die 200 lines later.
         run: mazda/m3-toolchain/bin/arm-cortexa9_neon-linux-gnueabi-g++ --version
 
       - name: Build release
