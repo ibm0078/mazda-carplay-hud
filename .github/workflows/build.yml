@@ -1,0 +1,53 @@
+name: build
+
+# Manual trigger ("Run workflow" button) plus an automatic build on every push,
+# so uploading a changed .cpp through the web UI is enough to kick off a build.
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    # 22.04 on purpose, not ubuntu-latest: m3-toolchain is a prebuilt crosstool-NG
+    # compiler and older prebuilt toolchains sometimes miss libraries that 24.04
+    # dropped. If this ever stops being offered, try ubuntu-latest.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout (with the m3-toolchain submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Make the cross-compiler executable
+        # Defensive: git normally preserves the exec bit, but a toolchain that
+        # arrives without it fails with a confusing "Permission denied".
+        run: chmod -R +x mazda/m3-toolchain/bin mazda/m3-toolchain/libexec || true
+
+      - name: Show the compiler version
+        # Fails loudly and early if the submodule did not come down, instead of
+        # letting make die on a missing binary 200 lines later.
+        run: mazda/m3-toolchain/bin/arm-cortexa9_neon-linux-gnueabi-g++ --version
+
+      - name: Build release
+        run: make -C mazda release
+
+      - name: Build debug
+        # Unstripped build that logs to /tmp/carplay_bridge.log on the car.
+        # Not for daily use - handy when a maneuver needs to be traced.
+        run: make -C mazda debug
+
+      - name: Confirm the outputs are ARM shared objects
+        run: |
+          file mazda/build/release/libpatch-blmjcicarplay.so
+          file mazda/build/debug/libpatch-blmjcicarplay.so
+          ls -l mazda/build/release/ mazda/build/debug/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: libpatch-blmjcicarplay
+          path: |
+            mazda/build/release/libpatch-blmjcicarplay.so
+            mazda/build/debug/libpatch-blmjcicarplay.so
+          if-no-files-found: error
