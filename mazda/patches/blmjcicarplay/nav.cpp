@@ -193,10 +193,16 @@ Maneuver classify(uint32_t mtype, uint32_t junctionType,
     case 53: m.event = EV_FORK;   m.side = SIDE_RIGHT; break;  // ChangeHighwayRight
     case 4:  m.event = EV_UTURN;  m.side = (driveSide == 1) ? SIDE_RIGHT : SIDE_LEFT; break; // UTurn
     case 26: m.event = EV_UTURN;  m.side = (driveSide == 1) ? SIDE_RIGHT : SIDE_LEFT; break; // UTurnWhenPossible
-    case 8:  m.event = EV_OFF_RAMP; m.side = SIDE_NONE;  break; // OffRamp
+    // Generic OffRamp/OnRamp: Apple gives no side. SIDE_NONE would index the icon
+    // table's column 2 = straight arrow, which contradicts the map (observed on TW
+    // motorway exits: HUD straight, map right-front). Fall back to the side ramps
+    // leave from in this traffic regime - RHT exits right, LHT exits left. Not
+    // universally right (a minority of interchanges exit the other side) but far
+    // better than pointing straight. 22/23/52/53 still win when Apple states a side.
+    case 8:  m.event = EV_OFF_RAMP; m.side = (driveSide == 1) ? SIDE_LEFT : SIDE_RIGHT; break; // OffRamp
     case 22: m.event = EV_OFF_RAMP; m.side = SIDE_LEFT;  break; // HighwayOffRampLeft
     case 23: m.event = EV_OFF_RAMP; m.side = SIDE_RIGHT; break; // HighwayOffRampRight
-    case 9:  m.event = EV_ON_RAMP;  m.side = SIDE_NONE;  break; // OnRamp
+    case 9:  m.event = EV_ON_RAMP;  m.side = (driveSide == 1) ? SIDE_LEFT : SIDE_RIGHT; break; // OnRamp
     case 15: case 16: case 17: m.event = EV_FERRY; m.side = SIDE_NONE; break; // Ferry
     case 10: case 12: case 27:  m.event = EV_DEST; m.side = SIDE_NONE;  break; // Arrive*
     case 24: m.event = EV_DEST; m.side = SIDE_LEFT;  break;  // ArriveDestinationLeft
