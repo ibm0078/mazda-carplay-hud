@@ -191,9 +191,12 @@ static size_t normalize_vn(const char *src, char *dst, size_t dst_sz)
             dst[di++] = static_cast<char>(0xC0 | (mapped >> 6));
             dst[di++] = static_cast<char>(0x80 | (mapped & 0x3F));
         } else {
-            // No Vietnamese mapping (non-VN 3-byte or any 4-byte) — show '?'
-            // so the slot stays visible (HUD would drop the original anyway).
-            dst[di++] = '?';
+            // [TW-PATCH] No Vietnamese mapping (non-VN 3-byte or any 4-byte) — drop
+            // it. Upstream emits '?' here to keep the slot visible, but on a CJK
+            // locale every character is unmappable, so a Chinese road name became a
+            // row of "??????". Dropping instead leaves an all-CJK name empty, and the
+            // road.empty() -> " " fallback below still keeps the slot visible as a
+            // clean blank. Mixed names keep their ASCII half ("Sec. 2").
         }
         s += nb;
     }
@@ -997,7 +1000,11 @@ void hud_on_distance(int32_t  /*distance_meters*/,
                      uint32_t display_distance_unit)
 {
     seqlock_begin();
-    g_snapshot.distance_dec  = display_distance / 100;   // raw*1000 (proto) -> raw*10 (HUD)
+    // raw*1000 (proto) -> raw*10 (HUD). Round rather than truncate: plain /100 turned
+    // 0.99 km into "0.9" and 249 m into "0.2", always reading short by up to one
+    // tick. Sole caller (nav.cpp) gates on dist > 0, so display_distance is positive
+    // and the +50 bias needs no sign handling.
+    g_snapshot.distance_dec  = (display_distance + 50) / 100;
     g_snapshot.distance_unit = map_distance_unit(display_distance_unit);
     g_snapshot.time_until    = time_until_seconds;
     g_last_nav.store((long)std::time(nullptr), std::memory_order_relaxed);  // [NAV-END]
