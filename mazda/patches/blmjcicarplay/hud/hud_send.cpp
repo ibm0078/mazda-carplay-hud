@@ -98,6 +98,18 @@ namespace {
 #define CARPLAY_VN_NORMALIZE 1
 #endif
 
+// [TW-PATCH] Toggle: 1 = never draw a street name on the HUD at all.
+// The cluster ECU's font has nothing above ~U+0800, so Traditional-Chinese road
+// names cannot render: upstream's normalize_vn() substitutes '?' for every
+// unmappable character and a Chinese name becomes a row of question marks.
+// Blank is cleaner than wrong. When this is 1 the normalize_vn() path below is
+// bypassed entirely (it stays compiled for the VN locale it was written for).
+// Set to 0 AND switch Apple Maps to English to get romanised names instead —
+// those arrive as ASCII, which the HUD renders fine.
+#ifndef CARPLAY_TW_BLANK_ROAD
+#define CARPLAY_TW_BLANK_ROAD 1
+#endif
+
 // Map a 3-byte Vietnamese codepoint (U+1E00..U+1EFF) to its best 2-byte
 // or 1-byte equivalent. Returns the replacement codepoint:
 //   - cp >= 0x80   : write as 2-byte UTF-8 (composed Latin char)
@@ -191,12 +203,9 @@ static size_t normalize_vn(const char *src, char *dst, size_t dst_sz)
             dst[di++] = static_cast<char>(0xC0 | (mapped >> 6));
             dst[di++] = static_cast<char>(0x80 | (mapped & 0x3F));
         } else {
-            // [TW-PATCH] No Vietnamese mapping (non-VN 3-byte or any 4-byte) — drop
-            // it. Upstream emits '?' here to keep the slot visible, but on a CJK
-            // locale every character is unmappable, so a Chinese road name became a
-            // row of "??????". Dropping instead leaves an all-CJK name empty, and the
-            // road.empty() -> " " fallback below still keeps the slot visible as a
-            // clean blank. Mixed names keep their ASCII half ("Sec. 2").
+            // No Vietnamese mapping (non-VN 3-byte or any 4-byte) — show '?'
+            // so the slot stays visible (HUD would drop the original anyway).
+            dst[di++] = '?';
         }
         s += nb;
     }
@@ -499,20 +508,27 @@ bool send_one(const NaviSnapshot &cur,
             sync_bit = static_cast<uint8_t>((sync_bit % 7) + 1);
         }
 
-#if CARPLAY_VN_NORMALIZE
+#if CARPLAY_TW_BLANK_ROAD
+        // [TW-PATCH] Street strip forced blank — see CARPLAY_TW_BLANK_ROAD above.
+        // A single space, never an empty string: an EMPTY road-name makes the
+        // cluster ECU draw uninitialised font memory in the street slot.
+        road = " ";
+#else
+  #if CARPLAY_VN_NORMALIZE
         // [VN-PATCH] Normalize Vietnamese 3-byte UTF-8 to 2-byte equivalents
         // the HUD font can render. E.g. "về hướng" -> "vê hương".
         char hud_name[sizeof(cur.road_name)];
         normalize_vn(cur.road_name, hud_name, sizeof(hud_name));
         road = hud_name;
-#else
+  #else
         road = cur.road_name;
-#endif
+  #endif
         // [VN-PATCH] An EMPTY road-name makes the Mazda HUD cluster ECU render
         // GARBAGE (uninitialised font memory) in the street slot. VietMap never
         // populates the AA Step.road field (Step.Builder hard-codes road=null),
         // so emit a single space -> HUD draws a clean blank slot, not garbage.
         if (road.empty()) road = " ";
+#endif
         msg2.guidancePointName = road.c_str();
         msg2.syncBit           = sync_bit;
     }
