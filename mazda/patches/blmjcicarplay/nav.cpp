@@ -66,6 +66,9 @@ constexpr int      kValidInfoOff    = 0x1c;   // u32 per-maneuver validInfo bitm
                                               // (field-presence gates only: 0x10=road,
                                               // 0x800=roundabout junction, 0x400=jAngle valid;
                                               // NO bit marks the imminent maneuver)
+constexpr uint32_t kJAngleValidBit  = 0x400;  // validInfo: junctionExitAngle@0x346 is present
+                                              // (Apple exposes it as CPManeuver.junctionExitAngle,
+                                              // an OPTIONAL "angle of the exit road of this junction")
 constexpr int      kManeuverTextOff = 0x24;
 constexpr int      kManeuverTextMax = 256;
 constexpr int      kManeuverTypeOff = 0x128;  // u32 maneuverType (was 0x124 = desc len)
@@ -150,10 +153,32 @@ uint32_t    g_prev_idx  = 0xffffffff;
 // recalc-heavy drives, leaving the HUD on an already-passed maneuver.)
 uint32_t    g_last_head       = 0;
 bool        g_last_head_valid = false;
+// [TW-PATCH] Burst indices dropped by the idx0/is_context_type gate, one bit each (bursts peak
+// ~33 entries, kMaxBurst is 48, so 64 bits covers every real route; an idx >= 64 is simply never
+// marked, which makes select_by_head fall back to its safe branch). Cleared with g_buf.
+uint64_t    g_ctx_mask        = 0;
+inline void ctx_mark(uint32_t idx)         { if (idx < 64) g_ctx_mask |= (1ULL << idx); }
+inline bool ctx_was_dropped(uint32_t idx)  { return idx < 64 && (g_ctx_mask & (1ULL << idx)) != 0; }
+
+// [TW-PATCH] Side for a maneuver that arrived as a GENERIC type (8 offRamp, 51 changeHighway)
+// rather than one of its sided variants (22/23 highwayOffRampLeft/Right, 52/53 changeHighway
+// Left/Right). Apple appears to spend a sided variant only when the maneuver leaves on the
+// UNCONVENTIONAL side: on a TW drive a left-hand exit rendered correctly (so it arrived as 22)
+// while every right-hand exit and the one highway-to-expressway transition arrived generic and
+// fell through to the icon table's straight-ahead column. So "generic" carries a meaning — it
+// is the side you would expect in this traffic regime.
+// Apple's own exit bearing wins whenever it is flagged present (signed degrees: 0 = straight,
+// negative = left, positive = right), which also covers a left exit that does arrive generic.
+uint32_t generic_ramp_side(int32_t junctionAngle, uint32_t driveSide, uint32_t validInfo)
+{
+    if ((validInfo & kJAngleValidBit) && junctionAngle != 0)
+        return (junctionAngle < 0) ? SIDE_LEFT : SIDE_RIGHT;
+    return (driveSide == 1) ? SIDE_LEFT : SIDE_RIGHT;   // LHT leaves left, RHT leaves right
+}
 
 // Map the standard CPManeuverType + junction fields to a HUD turn_event/side/angle.
 Maneuver classify(uint32_t mtype, uint32_t junctionType,
-                  int32_t junctionAngle, uint32_t driveSide)
+                  int32_t junctionAngle, uint32_t driveSide, uint32_t validInfo)
 {
     Maneuver m{EV_STRAIGHT, SIDE_NONE, 0, 0};
 
@@ -188,21 +213,24 @@ Maneuver classify(uint32_t mtype, uint32_t junctionType,
     case 50: m.event = EV_SLIGHT; m.side = SIDE_RIGHT; break;  // SlightRight
     case 13: m.event = EV_FORK;   m.side = SIDE_LEFT;  break;  // KeepLeft  (bear/fork)
     case 14: m.event = EV_FORK;   m.side = SIDE_RIGHT; break;  // KeepRight (bear/fork)
-    case 51: m.event = EV_FORK;   m.side = SIDE_NONE;  break;  // ChangeHighway
+    case 51: m.event = EV_FORK;   m.side = generic_ramp_side(junctionAngle, driveSide, validInfo);
+             break;                                            // ChangeHighway
     case 52: m.event = EV_FORK;   m.side = SIDE_LEFT;  break;  // ChangeHighwayLeft
     case 53: m.event = EV_FORK;   m.side = SIDE_RIGHT; break;  // ChangeHighwayRight
     case 4:  m.event = EV_UTURN;  m.side = (driveSide == 1) ? SIDE_RIGHT : SIDE_LEFT; break; // UTurn
     case 26: m.event = EV_UTURN;  m.side = (driveSide == 1) ? SIDE_RIGHT : SIDE_LEFT; break; // UTurnWhenPossible
-    // Generic OffRamp/OnRamp: Apple gives no side. SIDE_NONE would index the icon
-    // table's column 2 = straight arrow, which contradicts the map (observed on TW
-    // motorway exits: HUD straight, map right-front). Fall back to the side ramps
-    // leave from in this traffic regime - RHT exits right, LHT exits left. Not
-    // universally right (a minority of interchanges exit the other side) but far
-    // better than pointing straight. 22/23/52/53 still win when Apple states a side.
-    case 8:  m.event = EV_OFF_RAMP; m.side = (driveSide == 1) ? SIDE_LEFT : SIDE_RIGHT; break; // OffRamp
+    // [TW-PATCH] Generic OffRamp: SIDE_NONE indexes the icon table's column 2 = straight
+    // arrow, which contradicts the map (observed at 中壢交流道: HUD straight, map right).
+    // See generic_ramp_side(). 22/23 still win whenever Apple states the side itself.
+    case 8:  m.event = EV_OFF_RAMP; m.side = generic_ramp_side(junctionAngle, driveSide, validInfo);
+             break;                                             // OffRamp
     case 22: m.event = EV_OFF_RAMP; m.side = SIDE_LEFT;  break; // HighwayOffRampLeft
     case 23: m.event = EV_OFF_RAMP; m.side = SIDE_RIGHT; break; // HighwayOffRampRight
-    case 9:  m.event = EV_ON_RAMP;  m.side = (driveSide == 1) ? SIDE_LEFT : SIDE_RIGHT; break; // OnRamp
+    // OnRamp keeps SIDE_NONE on purpose: Apple's enum has NO onRampLeft/Right, so there is
+    // no sided variant for a generic value to contrast with and "generic" carries no side
+    // meaning at all — a guess here would be a coin flip. Ramp entries observed on a TW
+    // drive arrive as leftTurn/rightTurn anyway, which already carry the side.
+    case 9:  m.event = EV_ON_RAMP;  m.side = SIDE_NONE;  break; // OnRamp
     case 15: case 16: case 17: m.event = EV_FERRY; m.side = SIDE_NONE; break; // Ferry
     case 10: case 12: case 27:  m.event = EV_DEST; m.side = SIDE_NONE;  break; // Arrive*
     case 24: m.event = EV_DEST; m.side = SIDE_LEFT;  break;  // ArriveDestinationLeft
@@ -244,8 +272,16 @@ uint32_t read_u16(const uint8_t *b, long n, int off)
 // or -1 if neither is buffered yet (caller KEEPS the previous selection — never flash buf[0]).
 int select_by_head(uint32_t head)
 {
-    for (int i = 0; i < g_buf_count; ++i) if (g_buf[i].idx == head)     return i;
-    for (int i = 0; i < g_buf_count; ++i) if (g_buf[i].idx == head + 1) return i;
+    for (int i = 0; i < g_buf_count; ++i) if (g_buf[i].idx == head) return i;
+    // [TW-PATCH] Advance to head+1 ONLY when head really was dropped by the idx0/context gate.
+    // The old fallback was unconditional, so it also fired when head's maneuver had simply not
+    // streamed into the buffer yet — and then head+1 is the NEXT turn, painted as if it were
+    // imminent. Seen on a TW drive: map and distance both said "right turn ahead" while the HUD
+    // drew the left turn that came after it. Returning -1 makes the caller hold the previous
+    // selection instead, which self-corrects on the next burst/guidance frame.
+    if (ctx_was_dropped(head)) {
+        for (int i = 0; i < g_buf_count; ++i) if (g_buf[i].idx == head + 1) return i;
+    }
     return -1;
 }
 
@@ -333,11 +369,14 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
         // KEPT so the rebuilt window re-selects the same imminent.
         if (burst_start) {
             g_buf_count = 0;
+            g_ctx_mask  = 0;     // [TW-PATCH] the dropped-index record belongs to this burst
         }
 
         uint32_t mtype     = read_u32(b, n, kManeuverTypeOff);
         // Skip idx0 (heading) and in-list context entries — buffer only displayable turns.
-        if (idx == 0 || is_context_type(mtype)) return;
+        // [TW-PATCH] Record what we dropped: select_by_head needs to tell "head was a context
+        // entry, so head+1 is the real next maneuver" apart from "head just hasn't arrived".
+        if (idx == 0 || is_context_type(mtype)) { ctx_mark(idx); return; }
         if (g_buf_count >= kMaxBurst) return;
 
         uint32_t validInfo = read_u32(b, n, kValidInfoOff);
@@ -349,7 +388,7 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
         char     text[kManeuverTextMax + 1];
         read_str(b, n, kManeuverTextOff, text, sizeof(text));
 
-        Maneuver mv = classify(mtype, junction, jAngle, driveSide);
+        Maneuver mv = classify(mtype, junction, jAngle, driveSide, validInfo);
 
         BufManeuver &e = g_buf[g_buf_count++];
         e.mtype = mtype; e.idx = idx; e.validInfo = validInfo; e.mv = mv;
