@@ -162,11 +162,16 @@ inline bool ctx_was_dropped(uint32_t idx)  { return idx < 64 && (g_ctx_mask & (1
 
 // [TW-PATCH] Side for a maneuver that arrived as a GENERIC type (8 offRamp, 51 changeHighway)
 // rather than one of its sided variants (22/23 highwayOffRampLeft/Right, 52/53 changeHighway
-// Left/Right). Apple appears to spend a sided variant only when the maneuver leaves on the
-// UNCONVENTIONAL side: on a TW drive a left-hand exit rendered correctly (so it arrived as 22)
-// while every right-hand exit and the one highway-to-expressway transition arrived generic and
-// fell through to the icon table's straight-ahead column. So "generic" carries a meaning — it
-// is the side you would expect in this traffic regime.
+// Left/Right). Apple spends a sided variant only when the maneuver leaves on the UNCONVENTIONAL
+// side, so "generic" is not an absence of information — it means "the side you would expect in
+// this traffic regime".
+// Established on TW (right-hand traffic) drives, four samples, no exception:
+//   國3 -> 國2, OUTBOUND  exit on the LEFT  -> rendered left  (arrived sided, 52)
+//   國3 -> 國2, RETURN    exit on the RIGHT -> rendered straight (arrived generic, 51)
+//   中壢交流道, 國1 -> surface, exit RIGHT  -> rendered straight (generic, 8)
+//   板橋, expressway -> surface, exit LEFT  -> rendered left  (sided, 22)
+// The first two are the same physical interchange in opposite directions, which rules out
+// per-junction data quality: the only variable is which side the exit leaves from.
 // Apple's own exit bearing wins whenever it is flagged present (signed degrees: 0 = straight,
 // negative = left, positive = right), which also covers a left exit that does arrive generic.
 uint32_t generic_ramp_side(int32_t junctionAngle, uint32_t driveSide, uint32_t validInfo)
@@ -279,10 +284,13 @@ int select_by_head(uint32_t head)
     // imminent. Seen on a TW drive: map and distance both said "right turn ahead" while the HUD
     // drew the left turn that came after it. Returning -1 makes the caller hold the previous
     // selection instead, which self-corrects on the next burst/guidance frame.
-    if (ctx_was_dropped(head)) {
-        for (int i = 0; i < g_buf_count; ++i) if (g_buf[i].idx == head + 1) return i;
-    }
-    return -1;
+    // [TW-PATCH 2026-10-06] Holding the previous arrow was worse than showing the next one: when two
+    // consecutive maneuvers were not buffered/dropped (two left turns in a row on a TW drive) the HUD
+    // stayed on an already-passed right turn through both. Fall forward to the nearest buffered idx > head.
+    int best = -1;
+    for (int i = 0; i < g_buf_count; ++i)
+        if (g_buf[i].idx > head && (best < 0 || g_buf[i].idx < g_buf[best].idx)) best = i;
+    return best;
 }
 
 // [BUILD-19] Latch + emit the chosen buffered maneuver (sel = a g_buf index from select_by_head).
@@ -349,8 +357,9 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
     // [2026-06-13 #3] HUD was cleared (nav-off/unplug) -> reset selection + emit-dedup on THIS thread
     // so a re-started route always re-emits (even the same route, stationary). One-shot.
     if (g_nav_reset_req.exchange(false, std::memory_order_relaxed)) {
-        g_buf_count = 0; g_last_head_valid = false; g_last_head = 0;
-        g_prev_idx = 0xffffffff;
+        // [TW-PATCH 2026-10-08] Keep g_buf/g_last_head: a mid-route TBT-entity blip used to empty the
+        // buffer, and the HUD stayed blank (arrow + distance) until Apple re-sent a burst at the next
+        // maneuver. A genuinely new route re-sends its burst from idx 0, which clears the buffer anyway.
         g_emit_event = 0xffffffff; g_emit_side = 0xffffffff;
         g_emit_angle = 0x7fffffff; g_emit_number = 0x7fffffff;
         g_emit_road[0] = '\0';
@@ -362,7 +371,12 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
 
         // New burst? (index restarts at 0 or drops). Flush the now-complete previous burst
         // if a guidance message didn't already (back-to-back bursts), then start fresh.
-        bool burst_start = (idx == 0) || (idx < g_prev_idx);
+        // [TW-PATCH 2026-10-12] A backwards index is NOT a new list: iOS re-sends single maneuvers
+        // (e.g. an update to the current one) and never re-publishes the ones it already sent, so
+        // wiping the buffer here lost them until the next full re-list (same false positive fixed
+        // in luka-dev/mib2q-carplay-rgi rgd_hook.c, 2026-05-07). Only idx 0 starts a new list;
+        // same-idx entries overwrite below.
+        bool burst_start = (idx == 0);
         g_prev_idx = idx;
         // [BUILD-19] New burst (idx reset / drop): just clear the window. Selection is driven by the
         // guidance maneuverList head, not buf position, so there is nothing to "flush" here. g_last_head is
@@ -377,7 +391,9 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
         // [TW-PATCH] Record what we dropped: select_by_head needs to tell "head was a context
         // entry, so head+1 is the real next maneuver" apart from "head just hasn't arrived".
         if (idx == 0 || is_context_type(mtype)) { ctx_mark(idx); return; }
-        if (g_buf_count >= kMaxBurst) return;
+        int slot = -1;   // [TW-PATCH] same idx re-sent without an idx reset: overwrite, don't keep the stale first copy
+        for (int i = 0; i < g_buf_count; ++i) if (g_buf[i].idx == idx) { slot = i; break; }
+        if (slot < 0 && g_buf_count >= kMaxBurst) return;
 
         uint32_t validInfo = read_u32(b, n, kValidInfoOff);
         uint32_t driveSide = read_u32(b, n, kDriveSideOff);
@@ -390,7 +406,7 @@ extern "C" void nav_on_devmgr_msg(const void *msgp, long n)
 
         Maneuver mv = classify(mtype, junction, jAngle, driveSide, validInfo);
 
-        BufManeuver &e = g_buf[g_buf_count++];
+        BufManeuver &e = g_buf[slot >= 0 ? slot : g_buf_count++];
         e.mtype = mtype; e.idx = idx; e.validInfo = validInfo; e.mv = mv;
         strncpy(e.road, road, sizeof(e.road) - 1);
         e.road[sizeof(e.road) - 1] = '\0';
